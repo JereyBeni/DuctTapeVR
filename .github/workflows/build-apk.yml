@@ -19,8 +19,8 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+      # ubuntu-latest ya trae el Android SDK preinstalado (ANDROID_HOME).
+      # AGP instala los componentes que falten (platform/build-tools) automáticamente.
 
       - name: Set up Gradle 8.7
         uses: gradle/actions/setup-gradle@v4
