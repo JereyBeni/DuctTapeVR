@@ -199,7 +199,15 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
     }
 
     private void startAll() {
-        setupHandLandmarker();
+        // Si falla MediaPipe (por ejemplo, falta hand_landmarker.task), la GUI sigue funcionando
+        // sin control por mano, en lugar de cerrar la app.
+        try {
+            setupHandLandmarker();
+        } catch (Throwable e) {
+            Log.e(TAG, "MediaPipe no disponible", e);
+            handLandmarker = null;
+            status = "Control por mano no disponible: falta hand_landmarker.task en assets.";
+        }
         startCamera();
     }
 
@@ -268,7 +276,9 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
 
             MPImage mpImage = new BitmapImageBuilder(bmp).build();
             long ts = System.currentTimeMillis();
-            handLandmarker.detectAsync(mpImage, ts);
+            if (handLandmarker != null) {
+                handLandmarker.detectAsync(mpImage, ts);
+            }
         } catch (Exception e) {
             Log.e(TAG, "Error en el análisis de frame", e);
         } finally {
