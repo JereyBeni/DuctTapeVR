@@ -1,7 +1,6 @@
 package com.jere.vrback;
 
 import android.Manifest;
-import androidx.activity.ComponentActivity;
 import android.content.Context;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
@@ -17,6 +16,7 @@ import android.os.Bundle;
 import android.util.Log;
 import android.view.View;
 
+import androidx.activity.ComponentActivity;
 import androidx.annotation.NonNull;
 import androidx.camera.core.CameraSelector;
 import androidx.camera.core.ImageAnalysis;
@@ -30,25 +30,26 @@ import com.google.common.util.concurrent.ListenableFuture;
 import com.google.mediapipe.framework.image.BitmapImageBuilder;
 import com.google.mediapipe.framework.image.MPImage;
 import com.google.mediapipe.tasks.core.BaseOptions;
+import com.google.mediapipe.tasks.components.containers.NormalizedLandmark;
 import com.google.mediapipe.tasks.vision.core.RunningMode;
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker;
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarkerResult;
-import com.google.mediapipe.tasks.components.containers.NormalizedLandmark;
 
-import java.io.OutputStream;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
  * Activity 2: VR completo.
  * - Cámara trasera en pantalla dividida (un ojo por mitad).
- * - Orientación de cabeza con el sensor de rotación.
+ * - Orientación de cabeza con el sensor de rotación (con recentrado).
  * - Manos con MediaPipe HandLandmarker (modo LIVE_STREAM).
- * - GUI de botones que se activan al tocarlos con el índice.
+ * - GUI flotante: los paneles viven en "mundo" (yaw/pitch fijos) y se proyectan
+ *   según la orientación de la cabeza, con un leve movimiento de flotación.
  * - Si el dispositivo de salida es TV, envía telemetría por UDP.
  */
 public class MainActivity extends ComponentActivity implements SensorEventListener {
@@ -56,8 +57,14 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
     private static final String TAG = "VRBack";
     private static final int CAMERA_PERMISSION_REQ = 42;
     private static final int TV_TELEMETRY_PORT = 5005;
-    private static final long DWELL_MS = 600;     // tiempo que hay que mantener el dedo sobre un botón
-    private static final float YAW_SCALE = 900f;  // píxeles de desplazamiento de GUI por radián
+
+    private static final long DWELL_MS = 700;      // tiempo con el dedo sobre un panel para activarlo
+    private static final float FOV_DEG = 70f;      // campo de visión horizontal de cada ojo
+    private static final float IPD_PX = 24f;       // separación entre ojos (ajustable)
+    private static final float MAX_ANGLE_DEG = 80f;
+    private static final float PANEL_W_DEG = 12f;  // tamaño de cada panel en grados de visión
+    private static final float PANEL_H_DEG = 7f;
+    private static final long ACTION_TOAST_MS = 1500;
 
     private VrView vrView;
     private boolean showGui;
@@ -65,7 +72,9 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
     private String allowedApps;
 
     private SensorManager sensorManager;
-    private float yaw = 0f, pitch = 0f;
+    private volatile float headYawDeg = 0f, headPitchDeg = 0f; // relativos al centro
+    private float baseYaw = 0f, basePitch = 0f;
+    private boolean haveBase = false;
 
     private HandLandmarker handLandmarker;
     private ExecutorService analysisExecutor;
@@ -74,13 +83,29 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
     private volatile boolean handVisible = false;
 
     private DatagramSocket telemetrySocket;
-    private long dwellStart = 0;
-    private int dwellButton = -1;
 
-    private final Button[] buttons = {
-            new Button("Hola", 0.2f, 0.35f),
-            new Button("Ajustes", 0.5f, 0.35f),
-            new Button("Salir", 0.8f, 0.35f)
+    private int dwellIndex = -1;
+    private long dwellStart = 0;
+    private boolean dwellFired = false;
+    private String lastAction = null;
+    private long lastActionTime = 0;
+
+    // Paneles fijos en el "mundo", en grados respecto al centro de la vista.
+    private static class Panel {
+        final String label;
+        final float yawDeg, pitchDeg;
+        Panel(String label, float yawDeg, float pitchDeg) {
+            this.label = label;
+            this.yawDeg = yawDeg;
+            this.pitchDeg = pitchDeg;
+        }
+    }
+
+    private final Panel[] panels = {
+            new Panel("Hola", -20f, 0f),
+            new Panel("Ajustes", 0f, 0f),
+            new Panel("Salir", 20f, 0f),
+            new Panel("Centrar", 0f, -14f)
     };
 
     @Override
@@ -199,8 +224,6 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
             MPImage mpImage = new BitmapImageBuilder(bmp).build();
             long ts = System.currentTimeMillis();
             handLandmarker.detectAsync(mpImage, ts);
-
-            vrView.postInvalidate();
         } catch (Exception e) {
             Log.e(TAG, "Error en el análisis de frame", e);
         } finally {
@@ -232,20 +255,36 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
         float[] orientation = new float[3];
         SensorManager.getRotationMatrixFromVector(rotMatrix, event.values);
         SensorManager.getOrientation(rotMatrix, orientation);
-        yaw = orientation[0];
-        pitch = orientation[1];
+
+        float yawRad = orientation[0];
+        float pitchRad = orientation[1];
+
+        // La primera lectura (o tras "Centrar") fija el frente de la vista.
+        if (!haveBase) {
+            baseYaw = yawRad;
+            basePitch = pitchRad;
+            haveBase = true;
+        }
+        headYawDeg = (float) Math.toDegrees(wrapRad(yawRad - baseYaw));
+        headPitchDeg = (float) Math.toDegrees(pitchRad - basePitch);
     }
 
     @Override
     public void onAccuracyChanged(Sensor sensor, int accuracy) { }
 
+    private static float wrapRad(float a) {
+        while (a > Math.PI) a -= 2 * Math.PI;
+        while (a < -Math.PI) a += 2 * Math.PI;
+        return a;
+    }
+
     // ---------- Telemetría para el TV ----------
 
     private void sendTelemetryPacket() {
         if (telemetrySocket == null) return;
-        String json = String.format(java.util.Locale.US,
-                "{\"yaw\":%.3f,\"pitch\":%.3f,\"fx\":%.3f,\"fy\":%.3f,\"hand\":%b,\"gui\":%b,\"apps\":\"%s\"}",
-                yaw, pitch, fingerX, fingerY, handVisible, showGui, allowedApps);
+        String json = String.format(Locale.US,
+                "{\"yaw\":%.2f,\"pitch\":%.2f,\"fx\":%.3f,\"fy\":%.3f,\"hand\":%b,\"gui\":%b,\"apps\":\"%s\"}",
+                headYawDeg, headPitchDeg, fingerX, fingerY, handVisible, showGui, allowedApps);
         byte[] data = json.getBytes();
         analysisExecutor.execute(() -> {
             try {
@@ -258,33 +297,41 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
         });
     }
 
-    // ---------- Vista de VR ----------
+    // ---------- Acciones de la GUI ----------
 
-    private static class Button {
-        final String label;
-        final float nx, ny; // centro normalizado en el frame (0..1)
-        Button(String label, float nx, float ny) {
-            this.label = label;
-            this.nx = nx;
-            this.ny = ny;
+    private void onPanelPressed(int index) {
+        String label = panels[index].label;
+        Log.i(TAG, "Panel activado: " + label);
+        lastAction = label;
+        lastActionTime = System.currentTimeMillis();
+        switch (label) {
+            case "Salir":
+                finish();
+                break;
+            case "Centrar":
+                haveBase = false; // el próximo sensor fija un nuevo frente
+                break;
+            default:
+                break;
         }
     }
 
+    // ---------- Vista de VR ----------
+
     private class VrView extends View {
         private final Paint framePaint = new Paint(Paint.FILTER_BITMAP_FLAG);
-        private final Paint buttonPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint panelPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint dwellPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint cursorPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-        private static final float IPD_PX = 24f;
 
         VrView(Context c) {
             super(c);
-            buttonPaint.setColor(Color.argb(200, 30, 120, 220));
+            panelPaint.setColor(Color.argb(190, 30, 120, 220));
             textPaint.setColor(Color.WHITE);
-            textPaint.setTextSize(42f);
+            textPaint.setTextSize(36f);
             textPaint.setTextAlign(Paint.Align.CENTER);
-            dwellPaint.setColor(Color.argb(220, 255, 200, 0));
+            dwellPaint.setColor(Color.argb(230, 255, 200, 0));
             dwellPaint.setStyle(Paint.Style.STROKE);
             dwellPaint.setStrokeWidth(8f);
             cursorPaint.setColor(Color.RED);
@@ -295,82 +342,125 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
             int w = getWidth();
             int h = getHeight();
             int eyeW = w / 2;
+            float focal = focalPx(eyeW);
+            long t = System.currentTimeMillis();
 
-            Bitmap frame = latestFrame;
             canvas.drawColor(Color.BLACK);
 
-            // Desplazamiento horizontal de la imagen según la cabeza (simula mirar alrededor).
-            float shift = yaw * YAW_SCALE;
+            // El fondo se desplaza con la cabeza: al girar a un lado, la imagen se corre al contrario.
+            Bitmap frame = latestFrame;
+            float bgShift = -headYawDeg / FOV_DEG * eyeW;
 
             for (int eye = 0; eye < 2; eye++) {
                 int left = eye * eyeW;
+                float ipd = (eye == 0) ? -IPD_PX / 2 : IPD_PX / 2;
+
                 canvas.save();
                 canvas.clipRect(left, 0, left + eyeW, h);
                 if (frame != null) {
-                    RectF dst = new RectF(left + shift, 0, left + eyeW + shift, h);
-                    canvas.drawBitmap(frame, null, dst, framePaint);
+                    canvas.drawBitmap(frame, null,
+                            new RectF(left + bgShift, 0, left + eyeW + bgShift, h), framePaint);
                 }
                 if (showGui) {
-                    drawGui(canvas, left, eyeW, h, eye == 0 ? -IPD_PX / 2 : IPD_PX / 2, shift);
+                    drawPanels(canvas, left, eyeW, h, focal, ipd, t);
                 }
                 canvas.restore();
             }
 
-            // Cursor del dedo (sólo en el ojo izquierdo para no duplicar el cálculo).
+            // Mensaje de la última acción (centrado arriba, visible un momento).
+            if (lastAction != null && t - lastActionTime < ACTION_TOAST_MS) {
+                canvas.drawText("✓ " + lastAction, w / 2f, 60f, textPaint);
+            }
+
+            // Cursor del dedo, dibujado en ambos ojos.
             if (handVisible && fingerX >= 0) {
                 float cx = fingerX * eyeW;
                 float cy = fingerY * h;
                 canvas.drawCircle(cx, cy, 18f, cursorPaint);
-                checkDwell(cx / eyeW, cy / h);
+                canvas.drawCircle(cx + eyeW, cy, 18f, cursorPaint);
+                if (showGui) {
+                    checkDwell(cx, cy, eyeW, h, focal, t);
+                }
             } else {
-                dwellButton = -1;
+                dwellIndex = -1;
+                dwellFired = false;
             }
+
+            // Redibujar continuamente para que la flotación y la cámara se vean fluidas.
+            postInvalidateOnAnimation();
         }
 
-        private void drawGui(Canvas canvas, int left, int eyeW, int h, float ipdOffset, float shift) {
-            float bw = eyeW * 0.22f;
-            float bh = h * 0.12f;
-            for (int i = 0; i < buttons.length; i++) {
-                Button b = buttons[i];
-                float cx = left + b.nx * eyeW + ipdOffset + shift * 0.3f;
-                float cy = b.ny * h;
-                RectF r = new RectF(cx - bw / 2, cy - bh / 2, cx + bw / 2, cy + bh / 2);
-                canvas.drawRoundRect(r, 24, 24, buttonPaint);
-                canvas.drawText(b.label, cx, cy + textPaint.getTextSize() / 3, textPaint);
-                if (i == dwellButton) {
-                    canvas.drawRoundRect(r, 24, 24, dwellPaint);
+        private float focalPx(int eyeW) {
+            return (eyeW / 2f) / (float) Math.tan(Math.toRadians(FOV_DEG / 2));
+        }
+
+        // Proyecta un panel del "mundo" a coordenadas de pantalla dentro de un ojo.
+        // Devuelve null si el panel está fuera del campo de visión.
+        private float[] project(Panel p, int eyeW, int h, float focal, float bobPx) {
+            float dyaw = p.yawDeg - headYawDeg;
+            float dpitch = p.pitchDeg - headPitchDeg;
+            if (Math.abs(dyaw) > MAX_ANGLE_DEG || Math.abs(dpitch) > MAX_ANGLE_DEG) return null;
+            float x = eyeW / 2f + (float) Math.tan(Math.toRadians(dyaw)) * focal;
+            float y = h / 2f - (float) Math.tan(Math.toRadians(dpitch)) * focal + bobPx;
+            return new float[]{x, y};
+        }
+
+        private float bobFor(int index, long t) {
+            return (float) Math.sin(t / 500.0 + index * 1.3) * 8f; // flotación suave
+        }
+
+        private float panelWPx(float focal) {
+            return focal * (float) Math.tan(Math.toRadians(PANEL_W_DEG));
+        }
+
+        private float panelHPx(float focal) {
+            return focal * (float) Math.tan(Math.toRadians(PANEL_H_DEG));
+        }
+
+        private void drawPanels(Canvas c, int left, int eyeW, int h, float focal, float ipd, long t) {
+            float bw = panelWPx(focal);
+            float bh = panelHPx(focal);
+            for (int i = 0; i < panels.length; i++) {
+                float[] pos = project(panels[i], eyeW, h, focal, bobFor(i, t));
+                if (pos == null) continue;
+                RectF r = new RectF(left + pos[0] + ipd - bw / 2, pos[1] - bh / 2,
+                        left + pos[0] + ipd + bw / 2, pos[1] + bh / 2);
+                c.drawRoundRect(r, 24, 24, panelPaint);
+                c.drawText(panels[i].label, r.centerX(),
+                        r.centerY() + textPaint.getTextSize() / 3, textPaint);
+                if (i == dwellIndex) {
+                    c.drawRoundRect(r, 24, 24, dwellPaint);
                 }
             }
         }
 
-        private void checkDwell(float nx, float ny) {
+        // Hit-test en coordenadas del ojo izquierdo (sin separación entre ojos).
+        private void checkDwell(float cx, float cy, int eyeW, int h, float focal, long t) {
+            float bw = panelWPx(focal);
+            float bh = panelHPx(focal);
             int hit = -1;
-            for (int i = 0; i < buttons.length; i++) {
-                Button b = buttons[i];
-                if (Math.abs(nx - b.nx) < 0.11f && Math.abs(ny - b.ny) < 0.06f) {
+            for (int i = 0; i < panels.length; i++) {
+                float[] pos = project(panels[i], eyeW, h, focal, bobFor(i, t));
+                if (pos == null) continue;
+                if (Math.abs(cx - pos[0]) < bw / 2 && Math.abs(cy - pos[1]) < bh / 2) {
                     hit = i;
                     break;
                 }
             }
+
             if (hit == -1) {
-                dwellButton = -1;
+                dwellIndex = -1;
+                dwellFired = false;
                 return;
             }
-            long now = System.currentTimeMillis();
-            if (dwellButton != hit) {
-                dwellButton = hit;
-                dwellStart = now;
-            } else if (now - dwellStart >= DWELL_MS) {
-                onButtonPressed(hit);
-                dwellStart = now + 100000; // evita repetir el disparo
+            if (hit != dwellIndex) {
+                dwellIndex = hit;
+                dwellStart = t;
+                dwellFired = false;
+            } else if (!dwellFired && t - dwellStart >= DWELL_MS) {
+                dwellFired = true;
+                onPanelPressed(hit);
             }
-        }
-    }
-
-    private void onButtonPressed(int index) {
-        Log.i(TAG, "Botón presionado: " + buttons[index].label);
-        if ("Salir".equals(buttons[index].label)) {
-            finish();
         }
     }
 
