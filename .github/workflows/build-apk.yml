@@ -41,8 +41,14 @@ jobs:
       - name: Build debug APK
         run: gradle assembleDebug --stacktrace
 
-      - name: Upload APK
+      - name: Upload phone APK
         uses: actions/upload-artifact@v4
         with:
-          name: vr-back-debug-apk
+          name: vr-back-phone-apk
           path: app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Upload TV APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: vr-back-tv-apk
+          path: tv/build/outputs/apk/debug/tv-debug.apk

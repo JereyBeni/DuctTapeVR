@@ -1,0 +1,29 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.jere.vrback.tv'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.jere.vrback.tv"
+        minSdk 26
+        targetSdk 34
+        versionCode 2
+        versionName "1.0.1"
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+// Sin dependencias externas: org.json y sockets vienen con Android.
