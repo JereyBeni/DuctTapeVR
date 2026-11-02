@@ -2,6 +2,15 @@ plugins {
     id 'com.android.application'
 }
 
+// Claves desde el archivo .env de la raíz del repo (no versionado).
+// Si el archivo no existe (por ejemplo en CI sin secret), las claves quedan vacías.
+def envProps = new Properties()
+def envFile = rootProject.file('.env')
+if (envFile.exists()) {
+    envFile.withInputStream { envProps.load(it) }
+}
+def youtubeKey = envProps.getProperty('YOUTUBE_API_KEY', '')
+
 android {
     namespace 'com.jere.vrback'
     compileSdk 34
@@ -12,6 +21,12 @@ android {
         targetSdk 34
         versionCode 2
         versionName "1.0.1"
+
+        buildConfigField 'String', 'YOUTUBE_API_KEY', "\"${youtubeKey}\""
+    }
+
+    buildFeatures {
+        buildConfig true
     }
 
     buildTypes {

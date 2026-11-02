@@ -1,18 +1,26 @@
 package com.jere.vrback;
 
 import android.Manifest;
+import android.content.ActivityNotFoundException;
 import android.content.Context;
+import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.RectF;
+import android.graphics.drawable.Drawable;
 import android.hardware.Sensor;
 import android.hardware.SensorEvent;
 import android.hardware.SensorEventListener;
 import android.hardware.SensorManager;
+import android.net.Uri;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.text.TextPaint;
+import android.text.TextUtils;
 import android.util.Log;
 import android.view.View;
 
@@ -29,8 +37,8 @@ import androidx.lifecycle.LifecycleOwner;
 import com.google.common.util.concurrent.ListenableFuture;
 import com.google.mediapipe.framework.image.BitmapImageBuilder;
 import com.google.mediapipe.framework.image.MPImage;
-import com.google.mediapipe.tasks.core.BaseOptions;
 import com.google.mediapipe.tasks.components.containers.NormalizedLandmark;
+import com.google.mediapipe.tasks.core.BaseOptions;
 import com.google.mediapipe.tasks.vision.core.RunningMode;
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker;
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarkerResult;
@@ -38,6 +46,9 @@ import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarkerResult;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Date;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
@@ -45,11 +56,13 @@ import java.util.concurrent.Executors;
 
 /**
  * Activity 2: VR completo.
- * - Cámara trasera en pantalla dividida (un ojo por mitad).
+ * - Cámara trasera en pantalla dividida (un ojo por mitad), con velo oscuro bajo la GUI.
  * - Orientación de cabeza con el sensor de rotación (con recentrado).
  * - Manos con MediaPipe HandLandmarker (modo LIVE_STREAM).
- * - GUI flotante: los paneles viven en "mundo" (yaw/pitch fijos) y se proyectan
- *   según la orientación de la cabeza, con un leve movimiento de flotación.
+ * - GUI estilo Oculus: barra superior de pestañas, tarjetas de inicio y cuadrícula de juegos/videos.
+ *   Los paneles viven en "mundo" (yaw/pitch fijos) y se proyectan según la cabeza.
+ * - Play Story: lista los juegos instalados y los abre.
+ * - YouTube: tendencias y búsqueda por tema con YouTube Data API v3 (clave en .env).
  * - Si el dispositivo de salida es TV, envía telemetría por UDP.
  */
 public class MainActivity extends ComponentActivity implements SensorEventListener {
@@ -62,9 +75,15 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
     private static final float FOV_DEG = 70f;      // campo de visión horizontal de cada ojo
     private static final float IPD_PX = 24f;       // separación entre ojos (ajustable)
     private static final float MAX_ANGLE_DEG = 80f;
-    private static final float PANEL_W_DEG = 12f;  // tamaño de cada panel en grados de visión
-    private static final float PANEL_H_DEG = 7f;
-    private static final long ACTION_TOAST_MS = 1500;
+    private static final int PAGE_SIZE = 6;        // elementos por página en cuadrículas
+    private static final String YT_REGION = "AR";
+
+    private enum Screen { HOME, GAMES, YT_MENU, YT_RESULTS }
+    private enum Kind { NAV, TILE, CARD }
+    private enum Action {
+        GO_HOME, GO_GAMES, GO_YOUTUBE, YT_TRENDING, YT_SEARCH,
+        NEXT_PAGE, PREV_PAGE, LAUNCH_GAME, OPEN_VIDEO, RECENTER, EXIT
+    }
 
     private VrView vrView;
     private boolean showGui;
@@ -78,35 +97,59 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
 
     private HandLandmarker handLandmarker;
     private ExecutorService analysisExecutor;
+    private final ExecutorService netExecutor = Executors.newFixedThreadPool(2);
+    private final Handler main = new Handler(Looper.getMainLooper());
+    private final SimpleDateFormat clockFmt = new SimpleDateFormat("HH:mm", Locale.getDefault());
+
     private volatile Bitmap latestFrame;
     private volatile float fingerX = -1f, fingerY = -1f; // normalizado 0..1 sobre el frame
     private volatile boolean handVisible = false;
 
     private DatagramSocket telemetrySocket;
 
+    // ----- estado de la interfaz -----
+    private Screen screen = Screen.HOME;
+    private int page = 0;
+    private String status = null;             // mensaje de estado en la parte inferior
+
+    private List<GameLibrary.Game> games = new ArrayList<>();
+    private boolean gamesLoaded = false, gamesLoading = false;
+
+    private List<YouTubeApi.Video> videos = new ArrayList<>();
+    private boolean ytLoading = false;
+    private String ytTitle = "YouTube";
+
+    private final List<Panel> panels = new ArrayList<>();
     private int dwellIndex = -1;
     private long dwellStart = 0;
     private boolean dwellFired = false;
-    private String lastAction = null;
-    private long lastActionTime = 0;
 
-    // Paneles fijos en el "mundo", en grados respecto al centro de la vista.
+    // Un panel: posición en grados (yaw/pitch) y tamaño en grados de visión.
     private static class Panel {
         final String label;
-        final float yawDeg, pitchDeg;
-        Panel(String label, float yawDeg, float pitchDeg) {
+        final String subtitle;
+        final float yawDeg, pitchDeg, wDeg, hDeg;
+        final Kind kind;
+        final Action action;
+        final String data;
+        final boolean selected;
+        GameLibrary.Game game;
+        YouTubeApi.Video video;
+
+        Panel(String label, String subtitle, float yawDeg, float pitchDeg, float wDeg, float hDeg,
+              Kind kind, Action action, String data, boolean selected) {
             this.label = label;
+            this.subtitle = subtitle;
             this.yawDeg = yawDeg;
             this.pitchDeg = pitchDeg;
+            this.wDeg = wDeg;
+            this.hDeg = hDeg;
+            this.kind = kind;
+            this.action = action;
+            this.data = data;
+            this.selected = selected;
         }
     }
-
-    private final Panel[] panels = {
-            new Panel("Hola", -20f, 0f),
-            new Panel("Ajustes", 0f, 0f),
-            new Panel("Salir", 20f, 0f),
-            new Panel("Centrar", 0f, -14f)
-    };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -130,6 +173,8 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
                 Log.e(TAG, "No se pudo abrir el socket de telemetría", e);
             }
         }
+
+        rebuildPanels();
 
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
                 == PackageManager.PERMISSION_GRANTED) {
@@ -297,22 +342,225 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
         });
     }
 
-    // ---------- Acciones de la GUI ----------
+    // ---------- Navegación y construcción de paneles ----------
 
-    private void onPanelPressed(int index) {
-        String label = panels[index].label;
-        Log.i(TAG, "Panel activado: " + label);
-        lastAction = label;
-        lastActionTime = System.currentTimeMillis();
-        switch (label) {
-            case "Salir":
-                finish();
+    private void setScreen(Screen s) {
+        screen = s;
+        page = 0;
+        rebuildPanels();
+    }
+
+    /** Ubicación de la celda k dentro de una cuadrícula de 3 columnas x 2 filas. */
+    private static float[] slot(int k) {
+        int col = k % 3;
+        int row = k / 3;
+        return new float[]{(col - 1) * 24f, row == 0 ? 9f : -13f};
+    }
+
+    /** Reconstruye los paneles de la pantalla actual. Sólo en el hilo de UI. */
+    private void rebuildPanels() {
+        panels.clear();
+        dwellIndex = -1;
+        dwellFired = false;
+
+        // Barra superior de pestañas (estilo Oculus).
+        panels.add(new Panel("Inicio", "", -20f, 24f, 14f, 6f, Kind.NAV, Action.GO_HOME, null,
+                screen == Screen.HOME));
+        panels.add(new Panel("Play Story", "", 0f, 24f, 14f, 6f, Kind.NAV, Action.GO_GAMES, null,
+                screen == Screen.GAMES));
+        panels.add(new Panel("YouTube", "", 20f, 24f, 14f, 6f, Kind.NAV, Action.GO_YOUTUBE, null,
+                screen == Screen.YT_MENU || screen == Screen.YT_RESULTS));
+
+        // Barra inferior.
+        panels.add(new Panel("Centrar", "", -10f, -26f, 12f, 6f, Kind.NAV, Action.RECENTER, null, false));
+        panels.add(new Panel("Salir", "", 10f, -26f, 12f, 6f, Kind.NAV, Action.EXIT, null, false));
+
+        switch (screen) {
+            case HOME:
+                panels.add(new Panel("Play Story", "Tus juegos instalados", -16f, -2f, 22f, 24f,
+                        Kind.CARD, Action.GO_GAMES, null, false));
+                panels.add(new Panel("YouTube", "Tendencias y búsqueda por tema", 16f, -2f, 22f, 24f,
+                        Kind.CARD, Action.GO_YOUTUBE, null, false));
                 break;
-            case "Centrar":
+
+            case GAMES: {
+                int start = page * PAGE_SIZE;
+                int end = Math.min(games.size(), start + PAGE_SIZE);
+                for (int i = start; i < end; i++) {
+                    GameLibrary.Game g = games.get(i);
+                    float[] s = slot(i - start);
+                    Panel p = new Panel(g.label, "", s[0], s[1], 14f, 14f,
+                            Kind.TILE, Action.LAUNCH_GAME, g.packageName, false);
+                    p.game = g;
+                    panels.add(p);
+                }
+                addPager(games.size());
+                break;
+            }
+
+            case YT_MENU: {
+                panels.add(new Panel("Tendencias", "Argentina", 0f, 0f, 30f, 20f,
+                        Kind.CARD, Action.YT_TRENDING, null, false));
+                String[] topics = {"Música", "Juegos", "Ciencia", "Tutoriales"};
+                float[] yaws = {-22.5f, -7.5f, 7.5f, 22.5f};
+                for (int i = 0; i < topics.length; i++) {
+                    panels.add(new Panel(topics[i], "", yaws[i], -16f, 12f, 6f,
+                            Kind.NAV, Action.YT_SEARCH, topics[i].toLowerCase(Locale.ROOT), false));
+                }
+                break;
+            }
+
+            case YT_RESULTS: {
+                int start = page * PAGE_SIZE;
+                int end = Math.min(videos.size(), start + PAGE_SIZE);
+                for (int i = start; i < end; i++) {
+                    YouTubeApi.Video v = videos.get(i);
+                    float[] s = slot(i - start);
+                    Panel p = new Panel(v.title, v.channel, s[0], s[1], 14f, 14f,
+                            Kind.TILE, Action.OPEN_VIDEO, v.id, false);
+                    p.video = v;
+                    panels.add(p);
+                }
+                addPager(videos.size());
+                break;
+            }
+        }
+    }
+
+    private void addPager(int total) {
+        if (page > 0) {
+            panels.add(new Panel("Anterior", "", -32f, -26f, 14f, 6f,
+                    Kind.NAV, Action.PREV_PAGE, null, false));
+        }
+        if ((page + 1) * PAGE_SIZE < total) {
+            panels.add(new Panel("Siguiente", "", 32f, -26f, 14f, 6f,
+                    Kind.NAV, Action.NEXT_PAGE, null, false));
+        }
+    }
+
+    // ---------- Acciones ----------
+
+    private void onPanelPressed(Panel p) {
+        Log.i(TAG, "Activado: " + p.label);
+        switch (p.action) {
+            case GO_HOME:
+                setScreen(Screen.HOME);
+                break;
+            case GO_GAMES:
+                setScreen(Screen.GAMES);
+                loadGamesIfNeeded();
+                break;
+            case GO_YOUTUBE:
+                setScreen(Screen.YT_MENU);
+                break;
+            case YT_TRENDING:
+                ytTitle = "Tendencias en Argentina";
+                setScreen(Screen.YT_RESULTS);
+                fetchVideos(null);
+                break;
+            case YT_SEARCH:
+                ytTitle = "Búsqueda: " + p.label;
+                setScreen(Screen.YT_RESULTS);
+                fetchVideos(p.data);
+                break;
+            case NEXT_PAGE:
+                page++;
+                rebuildPanels();
+                break;
+            case PREV_PAGE:
+                page--;
+                rebuildPanels();
+                break;
+            case LAUNCH_GAME:
+                launchGame(p.data, p.label);
+                break;
+            case OPEN_VIDEO:
+                openVideo(p.data);
+                break;
+            case RECENTER:
                 haveBase = false; // el próximo sensor fija un nuevo frente
                 break;
-            default:
+            case EXIT:
+                finish();
                 break;
+        }
+    }
+
+    private void loadGamesIfNeeded() {
+        if (gamesLoaded || gamesLoading) return;
+        gamesLoading = true;
+        status = "Buscando juegos instalados…";
+        Context app = getApplicationContext();
+        netExecutor.execute(() -> {
+            List<GameLibrary.Game> list = GameLibrary.loadInstalledGames(app);
+            main.post(() -> {
+                games = list;
+                gamesLoaded = true;
+                gamesLoading = false;
+                status = list.isEmpty()
+                        ? "No se encontraron juegos instalados (con categoría de juego)."
+                        : null;
+                if (screen == Screen.GAMES) rebuildPanels();
+            });
+        });
+    }
+
+    private void fetchVideos(String query) {
+        if (ytLoading) return;
+        ytLoading = true;
+        videos = new ArrayList<>();
+        status = "Cargando videos…";
+        rebuildPanels();
+
+        final String key = BuildConfig.YOUTUBE_API_KEY;
+        netExecutor.execute(() -> {
+            try {
+                List<YouTubeApi.Video> list = (query == null)
+                        ? YouTubeApi.trending(key, YT_REGION, 12)
+                        : YouTubeApi.search(key, query, 12);
+                main.post(() -> {
+                    ytLoading = false;
+                    videos = list;
+                    status = list.isEmpty() ? "Sin resultados." : null;
+                    if (screen == Screen.YT_RESULTS) rebuildPanels();
+                    for (YouTubeApi.Video v : list) loadThumb(v);
+                });
+            } catch (Exception e) {
+                String msg = String.valueOf(e.getMessage());
+                main.post(() -> {
+                    ytLoading = false;
+                    status = "Error de YouTube: " + msg;
+                });
+            }
+        });
+    }
+
+    private void loadThumb(YouTubeApi.Video v) {
+        netExecutor.execute(() -> {
+            Bitmap b = YouTubeApi.downloadThumb(v.thumbUrl);
+            if (b != null) v.thumb = b; // se dibuja en el siguiente frame
+        });
+    }
+
+    private void launchGame(String pkg, String label) {
+        try {
+            Intent i = getPackageManager().getLaunchIntentForPackage(pkg);
+            if (i == null) {
+                status = "No se puede abrir " + label + ".";
+            } else {
+                startActivity(i);
+            }
+        } catch (ActivityNotFoundException e) {
+            status = "No se puede abrir " + label + ".";
+        }
+    }
+
+    private void openVideo(String videoId) {
+        try {
+            startActivity(new Intent(Intent.ACTION_VIEW,
+                    Uri.parse("https://www.youtube.com/watch?v=" + videoId)));
+        } catch (ActivityNotFoundException e) {
+            status = "No hay app para abrir el video.";
         }
     }
 
@@ -320,21 +568,32 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
 
     private class VrView extends View {
         private final Paint framePaint = new Paint(Paint.FILTER_BITMAP_FLAG);
+        private final Paint scrimPaint = new Paint();
         private final Paint panelPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-        private final Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint panelHoverPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint dwellPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint cursorPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint brandPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint hudPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final TextPaint labelPaint = new TextPaint(Paint.ANTI_ALIAS_FLAG);
+        private final TextPaint subPaint = new TextPaint(Paint.ANTI_ALIAS_FLAG);
 
         VrView(Context c) {
             super(c);
-            panelPaint.setColor(Color.argb(190, 30, 120, 220));
-            textPaint.setColor(Color.WHITE);
-            textPaint.setTextSize(36f);
-            textPaint.setTextAlign(Paint.Align.CENTER);
-            dwellPaint.setColor(Color.argb(230, 255, 200, 0));
+            scrimPaint.setColor(Color.argb(150, 8, 10, 16));
+            panelPaint.setColor(Color.argb(215, 24, 28, 40));
+            panelHoverPaint.setColor(Color.argb(240, 42, 112, 210));
+            dwellPaint.setColor(Color.argb(240, 255, 200, 0));
             dwellPaint.setStyle(Paint.Style.STROKE);
             dwellPaint.setStrokeWidth(8f);
             cursorPaint.setColor(Color.RED);
+            brandPaint.setColor(Color.rgb(160, 190, 240));
+            hudPaint.setColor(Color.WHITE);
+            hudPaint.setTextAlign(Paint.Align.CENTER);
+            labelPaint.setColor(Color.WHITE);
+            labelPaint.setTextAlign(Paint.Align.CENTER);
+            subPaint.setColor(Color.rgb(190, 200, 220));
+            subPaint.setTextAlign(Paint.Align.CENTER);
         }
 
         @Override
@@ -342,12 +601,13 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
             int w = getWidth();
             int h = getHeight();
             int eyeW = w / 2;
+            float u = h / 100f;               // unidad relativa al alto de pantalla
             float focal = focalPx(eyeW);
             long t = System.currentTimeMillis();
 
             canvas.drawColor(Color.BLACK);
 
-            // El fondo se desplaza con la cabeza: al girar a un lado, la imagen se corre al contrario.
+            // El fondo se desplaza con la cabeza.
             Bitmap frame = latestFrame;
             float bgShift = -headYawDeg / FOV_DEG * eyeW;
 
@@ -362,17 +622,17 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
                             new RectF(left + bgShift, 0, left + eyeW + bgShift, h), framePaint);
                 }
                 if (showGui) {
-                    drawPanels(canvas, left, eyeW, h, focal, ipd, t);
+                    canvas.drawRect(left, 0, left + eyeW, h, scrimPaint); // velo para leer la GUI
+                    drawPanels(canvas, left, eyeW, h, focal, ipd, t, u);
                 }
                 canvas.restore();
             }
 
-            // Mensaje de la última acción (centrado arriba, visible un momento).
-            if (lastAction != null && t - lastActionTime < ACTION_TOAST_MS) {
-                canvas.drawText("✓ " + lastAction, w / 2f, 60f, textPaint);
+            if (showGui) {
+                drawHud(canvas, w, h, u, t);
             }
 
-            // Cursor del dedo, dibujado en ambos ojos.
+            // Cursor del dedo, en ambos ojos.
             if (handVisible && fingerX >= 0) {
                 float cx = fingerX * eyeW;
                 float cy = fingerY * h;
@@ -386,12 +646,15 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
                 dwellFired = false;
             }
 
-            // Redibujar continuamente para que la flotación y la cámara se vean fluidas.
             postInvalidateOnAnimation();
         }
 
         private float focalPx(int eyeW) {
             return (eyeW / 2f) / (float) Math.tan(Math.toRadians(FOV_DEG / 2));
+        }
+
+        private float px(float deg, float focal) {
+            return focal * (float) Math.tan(Math.toRadians(deg));
         }
 
         // Proyecta un panel del "mundo" a coordenadas de pantalla dentro de un ojo.
@@ -409,40 +672,124 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
             return (float) Math.sin(t / 500.0 + index * 1.3) * 8f; // flotación suave
         }
 
-        private float panelWPx(float focal) {
-            return focal * (float) Math.tan(Math.toRadians(PANEL_W_DEG));
+        private RectF rectFor(Panel p, float cx, float cy, float focal) {
+            float bw = px(p.wDeg, focal);
+            float bh = px(p.hDeg, focal);
+            return new RectF(cx - bw / 2, cy - bh / 2, cx + bw / 2, cy + bh / 2);
         }
 
-        private float panelHPx(float focal) {
-            return focal * (float) Math.tan(Math.toRadians(PANEL_H_DEG));
-        }
-
-        private void drawPanels(Canvas c, int left, int eyeW, int h, float focal, float ipd, long t) {
-            float bw = panelWPx(focal);
-            float bh = panelHPx(focal);
-            for (int i = 0; i < panels.length; i++) {
-                float[] pos = project(panels[i], eyeW, h, focal, bobFor(i, t));
+        private void drawPanels(Canvas c, int left, int eyeW, int h, float focal, float ipd,
+                                long t, float u) {
+            for (int i = 0; i < panels.size(); i++) {
+                Panel p = panels.get(i);
+                float[] pos = project(p, eyeW, h, focal, bobFor(i, t));
                 if (pos == null) continue;
-                RectF r = new RectF(left + pos[0] + ipd - bw / 2, pos[1] - bh / 2,
-                        left + pos[0] + ipd + bw / 2, pos[1] + bh / 2);
-                c.drawRoundRect(r, 24, 24, panelPaint);
-                c.drawText(panels[i].label, r.centerX(),
-                        r.centerY() + textPaint.getTextSize() / 3, textPaint);
-                if (i == dwellIndex) {
-                    c.drawRoundRect(r, 24, 24, dwellPaint);
+                RectF r = rectFor(p, left + pos[0] + ipd, pos[1], focal);
+                drawPanel(c, p, r, i == dwellIndex, u);
+            }
+        }
+
+        private void drawPanel(Canvas c, Panel p, RectF r, boolean hovered, float u) {
+            c.save();
+            if (hovered) c.scale(1.06f, 1.06f, r.centerX(), r.centerY());
+
+            Paint fill = (p.selected || hovered) ? panelHoverPaint : panelPaint;
+            float radius = 2.5f * u;
+            c.drawRoundRect(r, radius, radius, fill);
+
+            switch (p.kind) {
+                case TILE: {
+                    RectF art = new RectF(r.left + 0.08f * r.width(), r.top + 0.08f * r.height(),
+                            r.right - 0.08f * r.width(), r.top + 0.66f * r.height());
+                    drawArt(c, p, art);
+                    labelPaint.setTextSize(2.8f * u);
+                    subPaint.setTextSize(2.2f * u);
+                    String label = TextUtils.ellipsize(p.label, labelPaint, r.width() * 0.92f,
+                            TextUtils.TruncateAt.END).toString();
+                    c.drawText(label, r.centerX(), r.top + 0.80f * r.height(), labelPaint);
+                    if (!p.subtitle.isEmpty()) {
+                        String sub = TextUtils.ellipsize(p.subtitle, subPaint, r.width() * 0.92f,
+                                TextUtils.TruncateAt.END).toString();
+                        c.drawText(sub, r.centerX(), r.top + 0.92f * r.height(), subPaint);
+                    }
+                    break;
                 }
+                case CARD: {
+                    labelPaint.setTextSize(5f * u);
+                    subPaint.setTextSize(2.6f * u);
+                    c.drawText(p.label, r.centerX(), r.top + 0.45f * r.height(), labelPaint);
+                    if (!p.subtitle.isEmpty()) {
+                        c.drawText(p.subtitle, r.centerX(), r.top + 0.62f * r.height(), subPaint);
+                    }
+                    break;
+                }
+                case NAV: {
+                    labelPaint.setTextSize(3.0f * u);
+                    c.drawText(p.label, r.centerX(), r.centerY() + labelPaint.getTextSize() / 3, labelPaint);
+                    break;
+                }
+            }
+
+            if (hovered) c.drawRoundRect(r, radius, radius, dwellPaint);
+            c.restore();
+        }
+
+        private void drawArt(Canvas c, Panel p, RectF art) {
+            if (p.game != null) {
+                Drawable icon = p.game.icon;
+                if (icon != null) {
+                    icon.setBounds((int) art.left, (int) art.top, (int) art.right, (int) art.bottom);
+                    icon.draw(c);
+                }
+            } else if (p.video != null && p.video.thumb != null) {
+                c.drawBitmap(p.video.thumb, null, art, framePaint);
+            }
+        }
+
+        private void drawHud(Canvas c, int w, int h, float u, long t) {
+            // Marca a la izquierda, hora a la derecha.
+            brandPaint.setTextSize(3f * u);
+            brandPaint.setTextAlign(Paint.Align.LEFT);
+            c.drawText("VR Back", 4 * u, 6 * u, brandPaint);
+
+            brandPaint.setTextAlign(Paint.Align.RIGHT);
+            c.drawText(clockFmt.format(new Date(t)), w - 4 * u, 6 * u, brandPaint);
+
+            // Título de la pantalla actual.
+            hudPaint.setTextSize(4f * u);
+            c.drawText(screenTitle(), w / 2f, 20 * u, hudPaint);
+
+            // Mensaje de estado.
+            if (status != null) {
+                hudPaint.setTextSize(2.6f * u);
+                c.drawText(status, w / 2f, h - 3 * u, hudPaint);
+            }
+        }
+
+        private String screenTitle() {
+            switch (screen) {
+                case HOME:
+                    return "Inicio";
+                case GAMES:
+                    return "Play Story · " + (gamesLoaded ? games.size() + " juegos" : "cargando");
+                case YT_MENU:
+                    return "YouTube";
+                case YT_RESULTS:
+                    return ytTitle;
+                default:
+                    return "";
             }
         }
 
         // Hit-test en coordenadas del ojo izquierdo (sin separación entre ojos).
         private void checkDwell(float cx, float cy, int eyeW, int h, float focal, long t) {
-            float bw = panelWPx(focal);
-            float bh = panelHPx(focal);
             int hit = -1;
-            for (int i = 0; i < panels.length; i++) {
-                float[] pos = project(panels[i], eyeW, h, focal, bobFor(i, t));
+            for (int i = 0; i < panels.size(); i++) {
+                Panel p = panels.get(i);
+                float[] pos = project(p, eyeW, h, focal, bobFor(i, t));
                 if (pos == null) continue;
-                if (Math.abs(cx - pos[0]) < bw / 2 && Math.abs(cy - pos[1]) < bh / 2) {
+                RectF r = rectFor(p, pos[0], pos[1], focal);
+                if (r.contains(cx, cy)) {
                     hit = i;
                     break;
                 }
@@ -459,7 +806,8 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
                 dwellFired = false;
             } else if (!dwellFired && t - dwellStart >= DWELL_MS) {
                 dwellFired = true;
-                onPanelPressed(hit);
+                Panel pressed = panels.get(hit);
+                onPanelPressed(pressed); // puede reconstruir la lista; no volver a usar índices
             }
         }
     }
@@ -470,5 +818,6 @@ public class MainActivity extends ComponentActivity implements SensorEventListen
         if (handLandmarker != null) handLandmarker.close();
         if (telemetrySocket != null) telemetrySocket.close();
         analysisExecutor.shutdown();
+        netExecutor.shutdownNow();
     }
 }

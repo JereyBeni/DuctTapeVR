@@ -13,6 +13,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Write .env from secrets
+        env:
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+        run: |
+          if [ -n "$YOUTUBE_API_KEY" ]; then
+            echo "YOUTUBE_API_KEY=$YOUTUBE_API_KEY" > .env
+          else
+            echo "::warning::Secret YOUTUBE_API_KEY no configurado. La app de YouTube no tendrá datos."
+          fi
+
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
